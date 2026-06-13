@@ -57,55 +57,62 @@ static void log_msg(const char *dll_path, const char *msg)
     fclose(f);
 }
 
-/* ------------------------------------------------------------------ */
-/* Memory scan + patch                                                  */
-/* ------------------------------------------------------------------ */
-
 #define PAGE_READABLE (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | \
                        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
 
-static void scan_and_patch(const char *dll_path, const uint8_t *new_key)
+/* ------------------------------------------------------------------ */
+/* Deferred patch thread — waits for CryPak to initialize, then scans  */
+/* ------------------------------------------------------------------ */
+
+static DWORD WINAPI patch_thread(LPVOID param)
 {
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
+    uint8_t *new_key = (uint8_t *)param;
 
-    MEMORY_BASIC_INFORMATION mbi;
-    uint8_t *addr = (uint8_t *)si.lpMinimumApplicationAddress;
-    int patches = 0;
+    /* Retry every 500ms for up to 30 seconds */
+    for (int attempt = 0; attempt < 60; attempt++) {
+        Sleep(500);
+        int found = 0;
 
-    while (addr < (uint8_t *)si.lpMaximumApplicationAddress) {
-        if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) break;
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        MEMORY_BASIC_INFORMATION mbi;
+        uint8_t *addr = (uint8_t *)si.lpMinimumApplicationAddress;
 
-        if (mbi.State == MEM_COMMIT &&
-            (mbi.Protect & PAGE_READABLE) &&
-            !(mbi.Protect & PAGE_GUARD) &&
-            mbi.RegionSize >= 140)
-        {
-            uint8_t *base = (uint8_t *)mbi.BaseAddress;
-            SIZE_T  size  = mbi.RegionSize;
+        while (addr < (uint8_t *)si.lpMaximumApplicationAddress) {
+            if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) break;
 
-            for (SIZE_T i = 0; i + 140 <= size; i++) {
-                /* Skip our own .rdata copy to avoid self-corruption */
-                if (base + i == VANILLA_KEY) continue;
-                if (memcmp(base + i, VANILLA_KEY, 140) == 0) {
-                    DWORD old_prot;
-                    if (VirtualProtect(base + i, 140, PAGE_READWRITE, &old_prot)) {
-                        memcpy(base + i, new_key, 140);
-                        VirtualProtect(base + i, 140, old_prot, &old_prot);
-                        patches++;
-                        char buf[64];
-                        snprintf(buf, sizeof(buf), "patched vanilla key at %p", (void *)(base + i));
-                        log_msg(dll_path, buf);
+            if (mbi.State == MEM_COMMIT &&
+                (mbi.Protect & PAGE_READABLE) &&
+                !(mbi.Protect & PAGE_GUARD) &&
+                mbi.RegionSize >= 140)
+            {
+                uint8_t *base = (uint8_t *)mbi.BaseAddress;
+                SIZE_T  size  = mbi.RegionSize;
+
+                for (SIZE_T i = 0; i + 140 <= size; i++) {
+                    if (base + i == VANILLA_KEY) continue;
+                    if (memcmp(base + i, VANILLA_KEY, 140) == 0) {
+                        DWORD old_prot;
+                        if (VirtualProtect(base + i, 140, PAGE_READWRITE, &old_prot)) {
+                            memcpy(base + i, new_key, 140);
+                            VirtualProtect(base + i, 140, old_prot, &old_prot);
+                            found++;
+                            char buf[80];
+                            snprintf(buf, sizeof(buf), "patched vanilla key at %p (attempt %d)",
+                                     (void *)(base + i), attempt + 1);
+                            log_msg(g_dll_path, buf);
+                        }
                     }
                 }
             }
+            addr += mbi.RegionSize;
         }
 
-        addr += mbi.RegionSize;
+        if (found > 0) break;
     }
 
-    if (patches == 0)
-        log_msg(dll_path, "vanilla key not found in memory (may already be patched or key changed)");
+    HeapFree(GetProcessHeap(), 0, new_key);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -143,8 +150,18 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
         return TRUE;
     }
 
-    log_msg(g_dll_path, "revival.pub loaded — scanning memory for vanilla key");
-    scan_and_patch(g_dll_path, pub_key);
+    log_msg(g_dll_path, "revival.pub loaded — scheduling deferred memory scan");
+
+    /* Copy pub_key into a heap buffer for the thread to use */
+    uint8_t *key_copy = (uint8_t *)HeapAlloc(GetProcessHeap(), 0, 140);
+    if (!key_copy) {
+        log_msg(g_dll_path, "ERROR: HeapAlloc failed");
+        return TRUE;
+    }
+    memcpy(key_copy, pub_key, 140);
+
+    /* Spawn a thread that waits for CryPak to initialize, then patches */
+    CreateThread(NULL, 0, patch_thread, key_copy, 0, NULL);
 
     return TRUE;
 }
