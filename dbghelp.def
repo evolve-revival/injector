@@ -1,0 +1,18 @@
+LIBRARY dbghelp
+EXPORTS
+    MiniDumpWriteDump
+    StackWalk64
+    SymCleanup
+    SymFromAddr
+    SymGetLineFromAddr64
+    SymGetModuleBase64
+    SymGetModuleInfo64
+    SymGetOptions
+    SymGetSearchPath
+    SymGetSymFromAddr64
+    SymInitialize
+    SymLoadModule64
+    SymSetOptions
+    SymSetSearchPath
+    SymUnloadModule64
+    UnDecorateSymbolName
