@@ -1,9 +1,12 @@
 LIBRARY dbghelp
 EXPORTS
     MiniDumpWriteDump
+    SearchTreeForFile
     StackWalk64
     SymCleanup
+    SymEnumerateModules64
     SymFromAddr
+    SymFunctionTableAccess64
     SymGetLineFromAddr64
     SymGetModuleBase64
     SymGetModuleInfo64

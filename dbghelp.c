@@ -19,6 +19,22 @@ static const uint8_t VANILLA_KEY[140] = {
 };
 
 static HMODULE real_dbghelp = NULL;
+static char    g_dll_path[MAX_PATH];
+
+/* ------------------------------------------------------------------ */
+/* Real dbghelp lazy loader (avoids LoadLibraryA inside DllMain)       */
+/* ------------------------------------------------------------------ */
+
+static HMODULE get_real_dbghelp(void)
+{
+    if (!real_dbghelp) {
+        char sys_path[MAX_PATH];
+        GetSystemDirectoryA(sys_path, MAX_PATH);
+        strncat(sys_path, "\\dbghelp.dll", MAX_PATH - strlen(sys_path) - 1);
+        real_dbghelp = LoadLibraryA(sys_path);
+    }
+    return real_dbghelp;
+}
 
 /* ------------------------------------------------------------------ */
 /* Logging                                                              */
@@ -30,7 +46,10 @@ static void log_msg(const char *dll_path, const char *msg)
     strncpy(log_path, dll_path, MAX_PATH - 1);
     log_path[MAX_PATH - 1] = '\0';
     char *sep = strrchr(log_path, '\\');
-    if (sep) strcpy(sep + 1, "revival_inject.log");
+    if (sep) {
+        size_t dir_len = (size_t)(sep + 1 - log_path);
+        snprintf(sep + 1, MAX_PATH - dir_len, "revival_inject.log");
+    }
 
     FILE *f = fopen(log_path, "a");
     if (!f) return;
@@ -66,6 +85,8 @@ static void scan_and_patch(const char *dll_path, const uint8_t *new_key)
             SIZE_T  size  = mbi.RegionSize;
 
             for (SIZE_T i = 0; i + 140 <= size; i++) {
+                /* Skip our own .rdata copy to avoid self-corruption */
+                if (base + i == VANILLA_KEY) continue;
                 if (memcmp(base + i, VANILLA_KEY, 140) == 0) {
                     DWORD old_prot;
                     if (VirtualProtect(base + i, 140, PAGE_READWRITE, &old_prot)) {
@@ -95,29 +116,22 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
 {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
 
-    char dll_path[MAX_PATH];
-    GetModuleFileNameA(hInst, dll_path, MAX_PATH);
+    GetModuleFileNameA(hInst, g_dll_path, MAX_PATH);
 
-    char sys_path[MAX_PATH];
-    GetSystemDirectoryA(sys_path, MAX_PATH);
-    strncat(sys_path, "\\dbghelp.dll", MAX_PATH - strlen(sys_path) - 1);
-    real_dbghelp = LoadLibraryA(sys_path);
-    if (!real_dbghelp)
-        log_msg(dll_path, "WARNING: failed to load system dbghelp.dll");
-
+    /* Build path to revival.pub (same directory as this DLL) */
     char pub_path[MAX_PATH];
-    strncpy(pub_path, dll_path, MAX_PATH - 1);
+    strncpy(pub_path, g_dll_path, MAX_PATH - 1);
     pub_path[MAX_PATH - 1] = '\0';
     char *sep = strrchr(pub_path, '\\');
     if (!sep) {
-        log_msg(dll_path, "ERROR: cannot determine DLL directory");
+        log_msg(g_dll_path, "ERROR: cannot determine DLL directory");
         return TRUE;
     }
     strcpy(sep + 1, "revival.pub");
 
     FILE *f = fopen(pub_path, "rb");
     if (!f) {
-        log_msg(dll_path, "revival.pub not found — loading game with vanilla key");
+        log_msg(g_dll_path, "revival.pub not found — loading game with vanilla key");
         return TRUE;
     }
     uint8_t pub_key[140];
@@ -125,43 +139,48 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
     fclose(f);
 
     if (n != 140) {
-        log_msg(dll_path, "ERROR: revival.pub is not 140 bytes — expected PKCS#1 DER RSA-1024 public key");
+        log_msg(g_dll_path, "ERROR: revival.pub is not 140 bytes — expected PKCS#1 DER RSA-1024 public key");
         return TRUE;
     }
 
-    log_msg(dll_path, "revival.pub loaded — scanning memory for vanilla key");
-    scan_and_patch(dll_path, pub_key);
+    log_msg(g_dll_path, "revival.pub loaded — scanning memory for vanilla key");
+    scan_and_patch(g_dll_path, pub_key);
 
     return TRUE;
 }
 
 /* ------------------------------------------------------------------ */
-/* Export stubs — forward to real dbghelp.dll                          */
+/* Export stubs — forward to real dbghelp.dll via lazy load            */
 /* ------------------------------------------------------------------ */
 
 #define STUB(ret, name, params, args, fail_ret)                          \
     typedef ret (WINAPI *name##_t) params;                               \
     ret WINAPI name params {                                             \
         static name##_t fn = NULL;                                       \
-        if (!fn && real_dbghelp)                                         \
-            fn = (name##_t)GetProcAddress(real_dbghelp, #name);         \
+        if (!fn) {                                                        \
+            HMODULE h = get_real_dbghelp();                              \
+            if (h) fn = (name##_t)GetProcAddress(h, #name);             \
+        }                                                                 \
         if (!fn) return fail_ret;                                        \
         return fn args;                                                  \
     }
 
-STUB(BOOL,  SymInitialize,      (HANDLE hp, PCSTR sp, BOOL inv),           (hp,sp,inv),    FALSE)
-STUB(BOOL,  SymCleanup,         (HANDLE hp),                                (hp),           FALSE)
-STUB(DWORD, SymGetOptions,      (void),                                     (),             0)
-STUB(DWORD, SymSetOptions,      (DWORD opts),                               (opts),         0)
-STUB(BOOL,  SymGetSearchPath,   (HANDLE hp, PSTR buf, DWORD len),           (hp,buf,len),   FALSE)
-STUB(BOOL,  SymSetSearchPath,   (HANDLE hp, PCSTR path),                    (hp,path),      FALSE)
-STUB(BOOL,  SymFromAddr,        (HANDLE hp, DWORD64 addr, PDWORD64 disp, PSYMBOL_INFO si), (hp,addr,disp,si), FALSE)
-STUB(BOOL,  SymGetLineFromAddr64,(HANDLE hp, DWORD64 addr, PDWORD disp, PIMAGEHLP_LINE64 line),(hp,addr,disp,line),FALSE)
-STUB(DWORD64,SymGetModuleBase64,(HANDLE hp, DWORD64 addr),                  (hp,addr),      0)
-STUB(BOOL,  SymGetModuleInfo64, (HANDLE hp, DWORD64 addr, PIMAGEHLP_MODULE64 mi),(hp,addr,mi),FALSE)
-STUB(DWORD64,SymLoadModule64,   (HANDLE hp, HANDLE fh, PCSTR img, PCSTR mod, DWORD64 base, DWORD size),(hp,fh,img,mod,base,size),0)
-STUB(BOOL,  SymUnloadModule64,  (HANDLE hp, DWORD64 base),                  (hp,base),      FALSE)
-STUB(BOOL,  StackWalk64,        (DWORD mt, HANDLE hp, HANDLE ht, LPSTACKFRAME64 sf, PVOID ctx, PREAD_PROCESS_MEMORY_ROUTINE64 rm, PFUNCTION_TABLE_ACCESS_ROUTINE64 fta, PGET_MODULE_BASE_ROUTINE64 gmb, PTRANSLATE_ADDRESS_ROUTINE64 ta),(mt,hp,ht,sf,ctx,rm,fta,gmb,ta),FALSE)
-STUB(BOOL,  SymGetSymFromAddr64,(HANDLE hp, DWORD64 addr, PDWORD64 disp, PIMAGEHLP_SYMBOL64 sym),(hp,addr,disp,sym),FALSE)
-STUB(DWORD, UnDecorateSymbolName,(PCSTR dec, PSTR out, DWORD sz, DWORD flags),(dec,out,sz,flags),0)
-STUB(BOOL,  MiniDumpWriteDump,  (HANDLE hp, DWORD pid, HANDLE hf, MINIDUMP_TYPE type, PMINIDUMP_EXCEPTION_INFORMATION ex, PMINIDUMP_USER_STREAM_INFORMATION usr, PMINIDUMP_CALLBACK_INFORMATION cb),(hp,pid,hf,type,ex,usr,cb),FALSE)
+STUB(BOOL,   SymInitialize,           (HANDLE hp, PCSTR sp, BOOL inv),                               (hp,sp,inv),          FALSE)
+STUB(BOOL,   SymCleanup,              (HANDLE hp),                                                   (hp),                 FALSE)
+STUB(DWORD,  SymGetOptions,           (void),                                                        (),                   0)
+STUB(DWORD,  SymSetOptions,           (DWORD opts),                                                  (opts),               0)
+STUB(BOOL,   SymGetSearchPath,        (HANDLE hp, PSTR buf, DWORD len),                              (hp,buf,len),         FALSE)
+STUB(BOOL,   SymSetSearchPath,        (HANDLE hp, PCSTR path),                                       (hp,path),            FALSE)
+STUB(BOOL,   SymFromAddr,             (HANDLE hp, DWORD64 addr, PDWORD64 disp, PSYMBOL_INFO si),     (hp,addr,disp,si),    FALSE)
+STUB(BOOL,   SymGetLineFromAddr64,    (HANDLE hp, DWORD64 addr, PDWORD disp, PIMAGEHLP_LINE64 ln),   (hp,addr,disp,ln),    FALSE)
+STUB(DWORD64,SymGetModuleBase64,      (HANDLE hp, DWORD64 addr),                                     (hp,addr),            0)
+STUB(BOOL,   SymGetModuleInfo64,      (HANDLE hp, DWORD64 addr, PIMAGEHLP_MODULE64 mi),              (hp,addr,mi),         FALSE)
+STUB(DWORD64,SymLoadModule64,         (HANDLE hp, HANDLE fh, PCSTR img, PCSTR mod, DWORD64 base, DWORD sz), (hp,fh,img,mod,base,sz), 0)
+STUB(BOOL,   SymUnloadModule64,       (HANDLE hp, DWORD64 base),                                     (hp,base),            FALSE)
+STUB(PVOID,  SymFunctionTableAccess64,(HANDLE hp, DWORD64 addr),                                     (hp,addr),            NULL)
+STUB(BOOL,   SymEnumerateModules64,   (HANDLE hp, PSYM_ENUMMODULES_CALLBACK64 cb, PVOID ctx),        (hp,cb,ctx),          FALSE)
+STUB(BOOL,   SearchTreeForFile,       (PSTR root, PSTR in, PSTR out),                                (root,in,out),        FALSE)
+STUB(BOOL,   StackWalk64,             (DWORD mt, HANDLE hp, HANDLE ht, LPSTACKFRAME64 sf, PVOID ctx, PREAD_PROCESS_MEMORY_ROUTINE64 rm, PFUNCTION_TABLE_ACCESS_ROUTINE64 fta, PGET_MODULE_BASE_ROUTINE64 gmb, PTRANSLATE_ADDRESS_ROUTINE64 ta), (mt,hp,ht,sf,ctx,rm,fta,gmb,ta), FALSE)
+STUB(BOOL,   SymGetSymFromAddr64,     (HANDLE hp, DWORD64 addr, PDWORD64 disp, PIMAGEHLP_SYMBOL64 sym), (hp,addr,disp,sym), FALSE)
+STUB(DWORD,  UnDecorateSymbolName,    (PCSTR dec, PSTR out, DWORD sz, DWORD flags),                  (dec,out,sz,flags),   0)
+STUB(BOOL,   MiniDumpWriteDump,       (HANDLE hp, DWORD pid, HANDLE hf, MINIDUMP_TYPE type, PMINIDUMP_EXCEPTION_INFORMATION ex, PMINIDUMP_USER_STREAM_INFORMATION usr, PMINIDUMP_CALLBACK_INFORMATION cb), (hp,pid,hf,type,ex,usr,cb), FALSE)
